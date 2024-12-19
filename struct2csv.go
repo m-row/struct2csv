@@ -44,8 +44,12 @@ func WriteCSV(
 	filename string,
 	data any,
 ) error {
+	// Set headers for CSV download
 	h.Set("Content-Type", "text/csv")
-	h.Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	h.Set(
+		"Content-Disposition",
+		fmt.Sprintf(`attachment; filename="%s"`, filename),
+	)
 
 	writer := csv.NewWriter(w)
 	defer writer.Flush()
@@ -64,69 +68,99 @@ func WriteCSV(
 		return errors.New("slice elements are not structs")
 	}
 
-	var headers []string
-	for i := 0; i < elemType.NumField(); i++ {
-		field := elemType.Field(i)
-		if tag := field.Tag.Get("csv"); tag != "-" {
-			if field.Type.Kind() == reflect.Struct &&
-				field.Type != reflect.TypeOf(time.Time{}) &&
-				!field.Anonymous {
-				for j := 0; j < field.Type.NumField(); j++ {
-					subField := field.Type.Field(j)
-					if subTag := subField.Tag.Get("csv"); subTag != "-" {
-						addedTag := fmt.Sprintf("%s.%s", tag, subTag)
-						headers = append(headers, addedTag)
-					}
-				}
-			} else {
-				headers = append(headers, tag)
-			}
-		}
+	// Generate headers
+	headers, err := extractHeaders(elemType)
+	if err != nil {
+		return fmt.Errorf("failed to extract headers: %w", err)
 	}
-
 	if err := writer.Write(headers); err != nil {
-		return errors.New("failed to write CSV headers")
+		return fmt.Errorf("failed to write headers: %w", err)
 	}
 
+	// Write rows
 	for i := 0; i < value.Len(); i++ {
-		row := []string{}
 		elem := value.Index(i)
 		if isPointer {
 			elem = elem.Elem()
 		}
-		for j := 0; j < elemType.NumField(); j++ {
-			field := elem.Field(j)
-			fieldType := elemType.Field(j)
-			csvTag := fieldType.Tag.Get("csv")
-			if csvTag == "-" {
-				continue
-			}
-			if fieldType.Type.Kind() == reflect.Struct &&
-				fieldType.Type != reflect.TypeOf(time.Time{}) &&
-				!fieldType.Anonymous {
-				// Handle sub-structs
-				for k := 0; k < field.NumField(); k++ {
-					subField := field.Field(k)
-					subFieldType := fieldType.Type.Field(k)
 
-					csvTag := subFieldType.Tag.Get("csv")
-					if csvTag == "-" {
-						continue
-					}
-					row = append(row, formatValue(subField))
-				}
-			} else {
-				// Handle regular fields
-				row = append(row, formatValue(field))
-			}
+		row, err := extractRow(elem, elemType)
+		if err != nil {
+			return fmt.Errorf("failed to extract row %d: %w", i, err)
 		}
+
 		if err := writer.Write(row); err != nil {
-			return errors.New("failed to write CSV row")
+			return fmt.Errorf("failed to write row %d: %w", i, err)
 		}
 	}
+
 	return nil
 }
 
+// extractHeaders generates CSV headers from struct tags
+func extractHeaders(elemType reflect.Type) ([]string, error) {
+	var headers []string
+	for i := 0; i < elemType.NumField(); i++ {
+		field := elemType.Field(i)
+		if isIgnoredField(field) {
+			continue
+		}
+
+		csvTag := field.Tag.Get("csv")
+		if isSubStruct(field) {
+			subHeaders, err := extractHeaders(field.Type)
+			if err != nil {
+				return nil, err
+			}
+			for _, subHeader := range subHeaders {
+				headers = append(
+					headers,
+					fmt.Sprintf("%s.%s", csvTag, subHeader),
+				)
+			}
+		} else {
+			headers = append(headers, csvTag)
+		}
+	}
+	return headers, nil
+}
+
+// extractRow generates a CSV row from a struct value
+func extractRow(value reflect.Value, elemType reflect.Type) ([]string, error) {
+	var row []string
+	for i := 0; i < elemType.NumField(); i++ {
+		field := elemType.Field(i)
+		if isIgnoredField(field) {
+			continue
+		}
+
+		fieldValue := value.Field(i)
+		if isSubStruct(field) {
+			subRow, err := extractRow(fieldValue, field.Type)
+			if err != nil {
+				return nil, err
+			}
+			row = append(row, subRow...)
+		} else {
+			row = append(row, formatValue(fieldValue))
+		}
+	}
+	return row, nil
+}
+
+// isIgnoredField Helper to check if a field should be ignored
+func isIgnoredField(field reflect.StructField) bool {
+	return field.Tag.Get("csv") == "-"
+}
+
+// isSubStruct Helper to check if a field is a sub-struct (non-time struct)
+func isSubStruct(field reflect.StructField) bool {
+	return field.Type.Kind() == reflect.Struct &&
+		field.Type != reflect.TypeOf(time.Time{}) &&
+		!field.Anonymous
+}
+
+// formatValue formats a field value into a string for CSV
 func formatValue(value reflect.Value) string {
 	if value.Kind() == reflect.Ptr {
 		if value.IsNil() {
@@ -145,9 +179,7 @@ func formatValue(value reflect.Value) string {
 		return strconv.FormatBool(value.Bool())
 	case reflect.Struct:
 		if value.Type() == reflect.TypeOf(time.Time{}) {
-			return value.Interface().(time.Time).Format(
-				"2006-01-02 15:04",
-			)
+			return value.Interface().(time.Time).Format("2006-01-02 15:04")
 		}
 		return ""
 	default:
